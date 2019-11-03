@@ -6,12 +6,14 @@
 
 require('dotenv').config()
 const AES = require('./lib/aes.js')
-const Config = require('./config.json')
 const cluster = require('cluster')
+require('colors')
+const Config = require('./config.json')
+const Helpers = require('./lib/helpers')
 const MessageSigner = require('./lib/messageSigner.js')
-const TurtleCoinUtils = require('turtlecoin-utils').CryptoNote
-const RabbitMQ = require('amqplib')
+const Rabbit = require('./lib/rabbit')
 const request = require('request-promise-native')
+const TurtleCoinUtils = require('turtlecoin-utils').CryptoNote
 const util = require('util')
 
 const cpuCount = require('os').cpus().length
@@ -19,145 +21,130 @@ const cryptoUtils = new TurtleCoinUtils()
 const signer = new MessageSigner()
 const topBlockUrl = Config.blockHeaderUrl + 'top'
 
-const publicRabbitHost = process.env.RABBIT_PUBLIC_SERVER || 'localhost'
-const publicRabbitUsername = process.env.RABBIT_PUBLIC_USERNAME || ''
-const publicRabbitPassword = process.env.RABBIT_PUBLIC_PASSWORD || ''
-
-const privateRabbitHost = process.env.RABBIT_PRIVATE_SERVER || 'localhost'
-const privateRabbitUsername = process.env.RABBIT_PRIVATE_USERNAME || ''
-const privateRabbitPassword = process.env.RABBIT_PRIVATE_PASSWORD || ''
-const privateRabbitEncryptionKey = process.env.RABBIT_PRIVATE_ENCRYPTION_KEY || ''
-
-function log (message) {
-  console.log(util.format('%s: %s', (new Date()).toUTCString(), message))
-}
-
 function spawnNewWorker () {
   cluster.fork()
 }
 
-/* Helps us to build the RabbitMQ connection string */
-function buildConnectionString (host, username, password) {
-  log(util.format('Setting up connection to %s@%s...', username, host))
-  var result = ['amqp://']
-
-  if (username.length !== 0 && password.length !== 0) {
-    result.push(username + ':')
-    result.push(password + '@')
+if (cluster.isMaster) {
+  if (!process.env.NODE_ENV || process.env.NODE_ENV.toLowerCase() !== 'production') {
+    Helpers.log('[WARNING] Node.js is not running in production mode. Consider running in production mode: export NODE_ENV=production'.yellow)
   }
 
-  result.push(host)
-
-  return result.join('')
-}
-
-if (cluster.isMaster) {
   for (var cpuThread = 0; cpuThread < cpuCount; cpuThread++) {
     spawnNewWorker()
   }
 
   cluster.on('exit', (worker, code, signal) => {
-    log(util.format('worker %s died', worker.process.pid))
+    Helpers.log(util.format('worker %s died', worker.process.pid))
     spawnNewWorker()
   })
 } else if (cluster.isWorker) {
-  (async function () {
-    try {
-      const crypto = new AES({ password: privateRabbitEncryptionKey })
+  const crypto = new AES({ password: process.env.RABBIT_PRIVATE_ENCRYPTION_KEY || '' })
 
-      /* Set up our access to the necessary RabbitMQ systems */
-      var incoming = await RabbitMQ.connect(buildConnectionString(publicRabbitHost, publicRabbitUsername, publicRabbitPassword))
-      var incomingChannel = await incoming.createChannel()
+  /* Set up our connection to the public RabbitMQ server */
+  const publicMQ = new Rabbit(
+    process.env.RABBIT_PUBLIC_SERVER || 'localhost',
+    process.env.RABBIT_PUBLIC_USERNAME || '',
+    process.env.RABBIT_PUBLIC_PASSWORD || '',
+    false
+  )
 
-      incoming.on('error', (error) => {
-        throw new Error(error)
+  publicMQ.on('log', log => {
+    Helpers.log(util.format('[RABBIT] %s', log))
+  })
+
+  publicMQ.on('connect', () => {
+    Helpers.log(util.format('[RABBIT] connected to server at %s', process.env.RABBIT_PUBLIC_SERVER || 'localhost'))
+  })
+
+  publicMQ.on('disconnect', (error) => {
+    Helpers.log(util.format('[RABBIT] lost connected to server: %s', error.toString()))
+    cluster.worker.kill()
+  })
+
+  /* Set up our connection to the private RabbitMQ server */
+  const privateMQ = new Rabbit(process.env.RABBIT_PRIVATE_SERVER || 'localhost', process.env.RABBIT_PRIVATE_USERNAME || '', process.env.RABBIT_PRIVATE_PASSWORD || '', false)
+  privateMQ.on('log', log => {
+    Helpers.log(util.format('[RABBIT] %s', log))
+  })
+
+  privateMQ.on('connect', () => {
+    Helpers.log(util.format('[RABBIT] connected to server at %s', process.env.RABBIT_PRIVATE_SERVER || 'localhost'))
+  })
+
+  privateMQ.on('disconnect', (error) => {
+    Helpers.log(util.format('[RABBIT] lost connected to server: %s', error.toString()))
+    cluster.worker.kill()
+  })
+
+  publicMQ.on('message', (queue, message, payload) => {
+    function run () {
+      /* Generate a new address, nothing fancy going on here, just a brand new address */
+      const newAddress = cryptoUtils.createNewAddress()
+      const tmp = {}
+
+      /* We need to go get some information about the current top block */
+      return request({
+        url: topBlockUrl,
+        json: true
       })
-      incomingChannel.on('error', (error) => {
-        throw new Error(error)
-      })
+        .then(topBlock => {
+          tmp.topBlock = topBlock
 
-      var outgoing = await RabbitMQ.connect(buildConnectionString(privateRabbitHost, privateRabbitUsername, privateRabbitPassword))
-      var outgoingChannel = await outgoing.createChannel()
+          /* Now that we know what our scan height is, we can get moving */
+          Helpers.log(util.format('Worker #%s: Created new wallet %s at height %s for %s', cluster.worker.id, newAddress.address, tmp.topBlock.height, message.properties.correlationId))
 
-      outgoing.on('error', (error) => {
-        throw new Error(error)
-      })
-      outgoingChannel.on('error', (error) => {
-        throw new Error(error)
-      })
+          /* Get a random set of keys for message signing */
+          return signer.generateKeys()
+        })
+        .then(keys => {
+          tmp.keys = keys
 
-      await incomingChannel.assertQueue(Config.queues.new)
-      await outgoingChannel.assertQueue(Config.queues.scan, {
-        durable: true
-      })
+          /* Construct our payload for sending via the private RabbitMQ server
+             to the workers that are actually scanning the wallets for incoming
+             funds */
+          const scanPayload = {
+            wallet: newAddress,
+            scanHeight: tmp.topBlock.height,
+            maxHeight: (tmp.topBlock.height + Config.maximumScanBlocks),
+            request: payload,
+            privateKey: tmp.keys.privateKey
+          }
 
-      incomingChannel.prefetch(1)
+          /* First, we encrypt the object that we are going to send to our queues */
+          const encryptedPayload = { encrypted: crypto.encrypt(scanPayload) }
 
-      /* Let's get any new wallet requests from the public facing API */
-      incomingChannel.consume(Config.queues.new, (message) => {
-        /* Is the message real? */
-        if (message !== null) {
-          /* Generate a new address, nothing fancy going on here, just a brand new address */
-          var newAddress = cryptoUtils.createNewAddress()
+          /* Go ahead and send that message to the scanning queue */
+          return privateMQ.sendToQueue(Config.queues.scan, encryptedPayload, { persistent: true })
+        })
+        .then(() => {
+          /* Construct our response back to the public API -- non-sensitive information */
+          const response = {
+            address: newAddress.address,
+            scanHeight: tmp.topBlock.height,
+            maxHeight: (tmp.topBlock.height + Config.maximumScanBlocks),
+            publicKey: tmp.keys.publicKey
+          }
 
-          /* We need to go get some information about the current top block */
-          request({
-            url: topBlockUrl,
-            json: true
-          }).then(async function (topBlock) {
-            /* Now that we know what our scan height is, we can get moving */
-            log(util.format('Worker #%s: Created new wallet %s at height %s for %s', cluster.worker.id, newAddress.address, topBlock.height, message.properties.correlationId))
-
-            /* Get a random set of keys for message signing */
-            const keys = await signer.generateKeys()
-
-            /* Construct our response back to the public API -- non-sensitive information */
-            const response = {
-              address: newAddress.address,
-              scanHeight: topBlock.height,
-              maxHeight: (topBlock.height + Config.maximumScanBlocks),
-              publicKey: keys.publicKey
-            }
-
-            /* Go ahead and fire that information back to the public API for the related request */
-            incomingChannel.sendToQueue(message.properties.replyTo, Buffer.from(JSON.stringify(response)), {
-              correlationId: message.properties.correlationId
-            })
-
-            /* Construct our payload for sending via the private RabbitMQ server
-               to the workers that are actually scanning the wallets for incoming
-               funds */
-            const scanPayload = {
-              wallet: newAddress,
-              scanHeight: topBlock.height,
-              maxHeight: (topBlock.height + Config.maximumScanBlocks),
-              request: JSON.parse(message.content.toString()),
-              privateKey: keys.privateKey
-            }
-
-            /* First, we encrypt the object that we are going to send to our queues */
-            const encryptedPayload = { encrypted: crypto.encrypt(scanPayload) }
-
-            /* Go ahead and send that message to the scanning queue */
-            outgoingChannel.sendToQueue(Config.queues.scan, Buffer.from(JSON.stringify(encryptedPayload)), { persistent: true })
-
-            /* Acknowledge that we've handled this new wallet request */
-            incomingChannel.ack(message)
-          }).catch((error) => {
-            /* If we weren't able to retrieve what the current top block is (height) then we're bailing */
-            log(util.format('Worker #%s: Could not create new wallet [%s]', cluster.worker.id, error.toString()))
-
-            /* Someone else can handle this request */
-            incomingChannel.nack(message)
-          })
-        }
-      })
-    } catch (e) {
-      /* Something went horribly wrong and this worker needs to go */
-      log(util.format('Error in worker #%s: %s', cluster.worker.id, e.toString()))
-      cluster.worker.kill()
+          /* Go ahead and fire that information back to the public API for the related request */
+          return publicMQ.reply(message, response)
+        })
     }
 
-    log(util.format('Worker #%s awaiting requests', cluster.worker.id))
-  }())
+    return run()
+      .then(() => { return publicMQ.ack(message) })
+      .catch(error => {
+        Helpers.log(util.format('[INFO] Error encountered in worker %s: %s', cluster.worker.id, error.toString()))
+        publicMQ.nack(message)
+          .catch((error) => Helpers.log(util.format('Worker #%s: Could not nack message [%s]', cluster.worker.id, error.toString())))
+      })
+  })
+
+  publicMQ.connect()
+    .then(() => { return publicMQ.createQueue(Config.queues.new) })
+    .then(() => { return privateMQ.connect() })
+    .then(() => { return privateMQ.createQueue(Config.queues.scan) })
+    .then(() => { return publicMQ.registerConsumer(Config.queues.new, 1) })
+
+  Helpers.log(util.format('Worker #%s awaiting requests', cluster.worker.id))
 }

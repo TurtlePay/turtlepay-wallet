@@ -29,6 +29,7 @@
   "dependencies": {
     "aes-js": "^3.1.2",
     "amqplib": "^0.5.5",
+    "colors": "^1.4.0",
     "dotenv": "^8.1.0",
     "pem": "^1.14.2",
     "request": "^2.88.0",

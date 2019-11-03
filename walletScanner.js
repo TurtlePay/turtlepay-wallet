@@ -6,9 +6,11 @@
 
 require('dotenv').config()
 const AES = require('./lib/aes.js')
-const Config = require('./config.json')
 const cluster = require('cluster')
-const RabbitMQ = require('amqplib')
+require('colors')
+const Config = require('./config.json')
+const Helpers = require('./lib/helpers')
+const Rabbit = require('./lib/rabbit')
 const request = require('request-promise-native')
 const TurtleCoinUtils = require('turtlecoin-utils').CryptoNote
 const util = require('util')
@@ -16,318 +18,308 @@ const util = require('util')
 const cpuCount = require('os').cpus().length
 const cryptoUtils = new TurtleCoinUtils()
 
-const publicRabbitHost = process.env.RABBIT_PUBLIC_SERVER || 'localhost'
-const publicRabbitUsername = process.env.RABBIT_PUBLIC_USERNAME || ''
-const publicRabbitPassword = process.env.RABBIT_PUBLIC_PASSWORD || ''
-
-const privateRabbitHost = process.env.RABBIT_PRIVATE_SERVER || 'localhost'
-const privateRabbitUsername = process.env.RABBIT_PRIVATE_USERNAME || ''
-const privateRabbitPassword = process.env.RABBIT_PRIVATE_PASSWORD || ''
-const privateRabbitEncryptionKey = process.env.RABBIT_PRIVATE_ENCRYPTION_KEY || ''
-
-function log (message) {
-  console.log(util.format('%s: %s', (new Date()).toUTCString(), message))
-}
-
 function spawnNewWorker () {
   cluster.fork()
 }
 
-/* Helps us to build the RabbitMQ connection string */
-function buildConnectionString (host, username, password) {
-  log(util.format('Setting up connection to %s@%s...', username, host))
-  var result = ['amqp://']
-
-  if (username.length !== 0 && password.length !== 0) {
-    result.push(username + ':')
-    result.push(password + '@')
+if (cluster.isMaster) {
+  if (!process.env.NODE_ENV || process.env.NODE_ENV.toLowerCase() !== 'production') {
+    Helpers.log('[WARNING] Node.js is not running in production mode. Consider running in production mode: export NODE_ENV=production'.yellow)
   }
 
-  result.push(host)
-
-  return result.join('')
-}
-
-if (cluster.isMaster) {
   for (var cpuThread = 0; cpuThread < cpuCount; cpuThread++) {
     spawnNewWorker()
   }
 
   cluster.on('exit', (worker, code, signal) => {
-    log(util.format('worker %s died', worker.process.pid))
+    Helpers.log(util.format('worker %s died', worker.process.pid))
     spawnNewWorker()
   })
 } else if (cluster.isWorker) {
-  (async function () {
-    try {
-      const crypto = new AES({ password: privateRabbitEncryptionKey })
+  const crypto = new AES({ password: process.env.RABBIT_PRIVATE_ENCRYPTION_KEY || '' })
 
-      /* Set up our access to the necessary RabbitMQ systems */
-      var publicRabbit = await RabbitMQ.connect(buildConnectionString(publicRabbitHost, publicRabbitUsername, publicRabbitPassword))
-      var publicChannel = await publicRabbit.createChannel()
+  /* Set up our connection to the public RabbitMQ server */
+  const publicMQ = new Rabbit(
+    process.env.RABBIT_PUBLIC_SERVER || 'localhost',
+    process.env.RABBIT_PUBLIC_USERNAME || '',
+    process.env.RABBIT_PUBLIC_PASSWORD || '',
+    false
+  )
 
-      publicRabbit.on('error', (error) => {
-        throw new Error(error)
-      })
-      publicChannel.on('error', (error) => {
-        throw new Error(error)
-      })
+  publicMQ.on('log', log => {
+    Helpers.log(util.format('[RABBIT] %s', log))
+  })
 
-      var privateRabbit = await RabbitMQ.connect(buildConnectionString(privateRabbitHost, privateRabbitUsername, privateRabbitPassword))
-      var privateChannel = await privateRabbit.createChannel()
+  publicMQ.on('connect', () => {
+    Helpers.log(util.format('[RABBIT] connected to server at %s', process.env.RABBIT_PUBLIC_SERVER || 'localhost'))
+  })
 
-      privateRabbit.on('error', (error) => {
-        throw new Error(error)
-      })
-      privateChannel.on('error', (error) => {
-        throw new Error(error)
-      })
+  publicMQ.on('disconnect', (error) => {
+    Helpers.log(util.format('[RABBIT] lost connected to server: %s', error.toString()))
+    cluster.worker.kill()
+  })
 
-      await publicChannel.assertQueue(Config.queues.complete, {
-        durable: true
-      })
-      await privateChannel.assertQueue(Config.queues.send, {
-        durable: true
-      })
+  /* Set up our connection to the private RabbitMQ server */
+  const privateMQ = new Rabbit(
+    process.env.RABBIT_PRIVATE_SERVER || 'localhost',
+    process.env.RABBIT_PRIVATE_USERNAME || '',
+    process.env.RABBIT_PRIVATE_PASSWORD || '',
+    false
+  )
 
-      privateChannel.prefetch(1)
+  privateMQ.on('log', log => {
+    Helpers.log(util.format('[RABBIT] %s', log))
+  })
 
-      privateChannel.consume(Config.queues.scan, async function (message) {
-        if (message !== null) {
-          var payload = JSON.parse(message.content.toString())
+  privateMQ.on('connect', () => {
+    Helpers.log(util.format('[RABBIT] connected to server at %s', process.env.RABBIT_PRIVATE_SERVER || 'localhost'))
+  })
 
-          /* If the payload is encrypted, we need to decrypt it */
-          if (payload.encrypted) {
-            payload = crypto.decrypt(payload.encrypted)
-          }
+  privateMQ.on('disconnect', (error) => {
+    Helpers.log(util.format('[RABBIT] lost connected to server: %s', error.toString()))
+    cluster.worker.kill()
+  })
 
-          log(util.format('Scanning for transactions to [%s]', payload.wallet.address))
-
-          var confirmationsRequired = (typeof payload.request.confirmations !== 'undefined') ? payload.request.confirmations : Config.defaultConfirmations
-
-          /* If someone somehow manages to send us through a request
-             with a very long number of confirmations we could end
-             up with a job stuck in our queue forever */
-          if (confirmationsRequired > Config.maximumConfirmations) {
-            confirmationsRequired = Config.maximumConfirmations
-          }
-
-          /* Let's get some basic block information regarding our wallet */
-          var topBlock
-          try {
-            topBlock = await request({ url: Config.blockHeaderUrl + 'top', json: true })
-          } catch (e) {
-            /* If we can't grab this information, then something went wrong and we need
-               to leave this for someone else to handle */
-            log(util.format('[ERROR] Worker #%s encountered an error retrieving block data', cluster.worker.id))
-            return privateChannel.nack(message)
-          }
-
-          /* If we're at the same block height as when the request was
-             created, then there's 0% chance that our transaction has
-             occurred */
-          if (topBlock.height === payload.scanHeight) {
-            return privateChannel.nack(message)
-          }
-
-          /* Let's go get blockchain transactional data so we can scan through it */
-          var syncData
-          try {
-            syncData = await request({ url: Config.syncUrl, json: true, method: 'POST', body: { scanHeight: payload.scanHeight, blockCount: (Config.maximumScanBlocks + 1) } })
-          } catch (e) {
-            /* That didn't work out well, let's just leave this for someone else */
-            log(util.format('[ERROR] Worker #%s could not retrieve sync data for wallet [%s]', cluster.worker.id, payload.wallet.address))
-            return privateChannel.nack(message)
-          }
-
-          /* We'll store our outputs in here */
-          var walletOutputs = []
-          var totalAmount = 0
-          var fundsFoundInBlock = 0
-
-          /* Loop through the returned blocks */
-          for (var i = 0; i < syncData.length; i++) {
-            var block = syncData[i]
-
-            /* Loop through transactions in the block */
-            for (var j = 0; j < block.transactions.length; j++) {
-              var transaction = block.transactions[j]
-
-              /* Check to see if any of the outputs in the transaction belong to us */
-              var outputs = cryptoUtils.scanTransactionOutputs(transaction.publicKey, transaction.outputs, payload.wallet.view.privateKey, payload.wallet.spend.publicKey, payload.wallet.spend.privateKey)
-
-              /* If we found outputs, we need to store the top block height we found
-                 the funds in so we know where to start our confirmation check from */
-              if (outputs.length !== 0 && block.height > fundsFoundInBlock) {
-                fundsFoundInBlock = block.height
-              }
-
-              /* Loop through any found outputs and start tallying them up */
-              for (var l = 0; l < outputs.length; l++) {
-                totalAmount += outputs[l].amount
-                walletOutputs.push(outputs[l])
-              }
-            }
-          }
-
-          /* Did we find some outputs for us? */
-          if (walletOutputs.length > 0) {
-            /* Did we find all the funds we requested and do we have the required confirmations? */
-            if (totalAmount >= payload.request.amount && (topBlock.height - fundsFoundInBlock) >= confirmationsRequired) {
-              /* Congrats, we found all the funds that we requested and we're ready
-                 to send them on */
-
-              /* Generate the response for sending it back to the requestor,
-                 to let them know that funds were received (still incomplete) */
-              var goodResponse = {
-                address: payload.wallet.address,
-                amount: totalAmount,
-                status: 100, // Continue
-                request: payload.request,
-                privateKey: payload.privateKey
-              }
-
-              publicChannel.sendToQueue(Config.queues.complete, Buffer.from(JSON.stringify(goodResponse)), {
-                persistent: true
-              })
-
-              /* Stick our funds in our payload */
-              payload.funds = walletOutputs
-
-              /* First we encrypt the object that we are going to send to our queues */
-              const encryptedPayload = { encrypted: crypto.encrypt(payload) }
-
-              /* Signal to the workers who send the funds to their real destination that things are ready */
-              privateChannel.sendToQueue(Config.queues.send, Buffer.from(JSON.stringify(encryptedPayload)), {
-                persistent: true
-              })
-
-              /* This request is now complete from the scanning standpoint */
-              log(util.format('[INFO] Worker #%s found %s for [%s] and is forwarding request to send workers', cluster.worker.id, totalAmount, payload.wallet.address))
-              return privateChannel.ack(message)
-            } else if (totalAmount >= payload.request.amount) {
-              /* We found all the funds we need, but we don't have enough confirmations yet */
-              log(util.format('[INFO] Worker #%s found %s for [%s] but is awaiting confirmations. %s blocks to go', cluster.worker.id, totalAmount, payload.wallet.address, (confirmationsRequired - (topBlock.height - fundsFoundInBlock))))
-
-              var confirmationsRemaining = confirmationsRequired - (topBlock.height - fundsFoundInBlock)
-              if (confirmationsRemaining < 0) {
-                confirmationsRemaining = 0
-              }
-
-              /* We need to let everyone know that we found their monies but we need more confirmations */
-              var waitingForConfirmations = {
-                address: payload.wallet.address,
-                amount: totalAmount,
-                confirmationsRemaining: confirmationsRemaining,
-                status: 102,
-                request: payload.request,
-                privateKey: payload.privateKey
-              }
-
-              publicChannel.sendToQueue(Config.queues.complete, Buffer.from(JSON.stringify(waitingForConfirmations)), {
-                persistent: true
-              })
-
-              return privateChannel.nack(message)
-            } else if (topBlock.height > payload.maxHeight && (topBlock.height - fundsFoundInBlock) >= confirmationsRequired) {
-              /* We found founds but it's not at least the amount that we requested
-                 unfortunately, we've also ran out of time to look for more */
-
-              /* Build a response that we can send back to the requestor to let them know
-                 that we've received some funds, but not all of them, but that their
-                 request has been timed out */
-              var partialResponse = {
-                address: payload.wallet.address,
-                status: 206, // Partial Content (aka Partial Payment)
-                request: payload.request,
-                privateKey: payload.privateKey
-              }
-
-              publicChannel.sendToQueue(Config.queues.complete, Buffer.from(JSON.stringify(partialResponse)), {
-                persistent: true
-              })
-
-              /* Stick our funds in our payload */
-              payload.funds = walletOutputs
-
-              /* First we encrypt the object that we are going to send to our queues */
-              const encryptedPayload = { encrypted: crypto.encrypt(payload) }
-
-              /* Signal to the workers who send the funds to their real destination that things are ready */
-              privateChannel.sendToQueue(Config.queues.send, Buffer.from(JSON.stringify(encryptedPayload)), {
-                persistent: true
-              })
-
-              /* This request is now complete from the scanning standpoint */
-              log(util.format('[INFO] Worker #%s found %s for [%s] and is forwarding request to send workers', cluster.worker.id, totalAmount, payload.wallet.address))
-              return privateChannel.ack(message)
-            } else {
-              /* We found some funds, it's not what we're looking for but we still have time
-                 to keep looking for more */
-              log(util.format('[INFO] Worker #%s found %s for [%s] but we need to look for more', cluster.worker.id, totalAmount, payload.wallet.address))
-
-              var blocksRemaining = (payload.maxHeight - topBlock.height)
-              if (blocksRemaining < 0) {
-                blocksRemaining = 0
-              }
-
-              /* We need to let everyone know that we found some monies but we need more */
-              var waitingForConfirmationsNotEnough = {
-                address: payload.wallet.address,
-                amount: totalAmount,
-                blocksRemaining: blocksRemaining,
-                status: 102,
-                request: payload.request,
-                privateKey: payload.privateKey
-              }
-
-              publicChannel.sendToQueue(Config.queues.complete, Buffer.from(JSON.stringify(waitingForConfirmationsNotEnough)), {
-                persistent: true
-              })
-
-              return privateChannel.nack(message)
-            }
-          }
-
-          /* We need to observe the maximum amount of time
-             that we are going to look for transactions if we
-             don't find anything that we're looking for */
-          if (topBlock.height > payload.maxHeight && walletOutputs.length === 0) {
-            var response = {
-              address: payload.wallet.address,
-              keys: {
-                privateSpend: payload.wallet.spend.privateKey,
-                privateView: payload.wallet.view.privateKey
-              },
-              status: 408, // Request Timed Out
-              request: payload.request,
-              privateKey: payload.privateKey
-            }
-
-            /* Send the 'cancelled' wallet back to the public
-               workers that will signal to the caller that the
-               request has been abandoned */
-            publicChannel.sendToQueue(Config.queues.complete, Buffer.from(JSON.stringify(response)), {
-              persistent: true
-            })
-
-            /* That's it, we're done with this request */
-            log(util.format('[INFO] Worker #%s timed out wallet [%s]', cluster.worker.id, payload.wallet.address))
-            return privateChannel.ack(message)
-          }
-
-          /* If our request has not been timed out (cancelled) and
-             we didn't find our funds yet, then let's throw it
-             back in the queue for checking again later */
-
-          return privateChannel.nack(message)
+  privateMQ.on('message', (queue, message, payload) => {
+    function run () {
+      return new Promise((resolve, reject) => {
+        /* If the payload is encrypted, we need to decrypt it */
+        if (payload.encrypted) {
+          payload = crypto.decrypt(payload.encrypted)
         }
+
+        Helpers.log(util.format('Scanning for transactions to [%s]', payload.wallet.address))
+
+        var confirmationsRequired = (typeof payload.request.confirmations !== 'undefined') ? payload.request.confirmations : Config.defaultConfirmations
+
+        /* If someone somehow manages to send us through a request
+           with a very long number of confirmations we could end
+           up with a job stuck in our queue forever */
+        if (confirmationsRequired > Config.maximumConfirmations) {
+          confirmationsRequired = Config.maximumConfirmations
+        }
+
+        /* Let's get some basic block inofmration regarding our wallet */
+        request({
+          url: Config.blockHeaderUrl + 'top',
+          json: true
+        })
+          .then(topBlock => {
+            payload.topBlock = topBlock
+
+            /* If we're at the same block height as when the request was
+               created, then there's 0% chance that our transaction has
+               occurred */
+            if (topBlock.height === payload.scanHeight) {
+              return reject(new Error('Blockchain is at the same height as when the request was created'))
+            }
+
+            /* Let's go get blockchain transactional data so we can scan through it */
+
+            return request({
+              url: Config.syncUrl,
+              json: true,
+              method: 'POST',
+              body: {
+                scanHeight: payload.scanHeight,
+                blockCount: (Config.maximumScanBlocks + 1)
+              }
+            })
+          })
+          .then(syncData => {
+            /* Set up basic storage for some wallet information */
+            payload.walletOutputs = []
+            payload.totalAmount = 0
+            payload.fundsFoundInBlock = 0
+
+            /* Loop through the returned blocks */
+            for (var i = 0; i < syncData.length; i++) {
+              var block = syncData[i]
+
+              /* Loop through transactions in the block */
+              for (var j = 0; j < block.transactions.length; j++) {
+                var transaction = block.transactions[j]
+
+                /* Check to see if any of the outputs in the transaction belong to us */
+                var outputs = cryptoUtils.scanTransactionOutputs(transaction.publicKey, transaction.outputs, payload.wallet.view.privateKey, payload.wallet.spend.publicKey, payload.wallet.spend.privateKey)
+
+                /* If we found outputs, we need to store the top block height we found
+                   the funds in so we know where to start our confirmation check from */
+                if (outputs.length !== 0 && block.height > payload.fundsFoundInBlock) {
+                  payload.fundsFoundInBlock = block.height
+                }
+
+                /* Loop through any found outputs and start tallying them up */
+                for (var l = 0; l < outputs.length; l++) {
+                  payload.totalAmount += outputs[l].amount
+                  payload.walletOutputs.push(outputs[l])
+                }
+              }
+            }
+          })
+          .then(() => {
+            /* Did we find some outputs for us? */
+            if (payload.walletOutputs.length > 0) {
+              /* Did we find all the funds we requested and do we have the required confirmations? */
+              if (payload.totalAmount >= payload.request.amount && (payload.topBlock.height - payload.fundsFoundInBlock) >= confirmationsRequired) {
+                /* Congrats, we found all the funds that we requested and we're ready
+                   to send them on. Generate the response for sending it back to the
+                   requestor to let them know that funds were received (still incomplete) */
+                const goodResponse = {
+                  address: payload.wallet.address,
+                  amount: payload.totalAmount,
+                  status: 100, // Continue
+                  request: payload.request,
+                  privateKey: payload.privateKey
+                }
+
+                /* Stick our funds in our payload and clean up our stack */
+                payload.funds = payload.walletOutputs
+                const totalAmount = payload.totalAmount
+                delete payload.walletOutputs
+                delete payload.totalAmount
+                delete payload.fundsFoundInBlock
+
+                /* Encrypt our payload */
+                const encryptedPayload = { encrypted: crypto.encrypt(payload) }
+
+                Helpers.log(util.format('[INFO] Worker #%s found %s for [%s] and is forwarding request to send workers', cluster.worker.id, totalAmount, payload.wallet.address))
+
+                /* Signal to the workers who send the funds to their real destination that things are ready */
+                privateMQ.sendToQueue(Config.queues.send, encryptedPayload, { persistent: true })
+                  .then(() => { return publicMQ.sendToQueue(Config.queues.complete, goodResponse, { persistent: true }) })
+                  .then(() => { return privateMQ.ack(message) })
+                  .then(() => { return resolve() })
+              } else if (payload.totalAmount >= payload.request.amount) {
+                /* We found all the funds we need, but we don't have enough confirmations yet */
+
+                var confirmationsRemaining = confirmationsRequired - (payload.topBlock.height - payload.fundsFoundInBlock)
+                if (confirmationsRemaining < 0) {
+                  confirmationsRemaining = 0
+                }
+
+                /* We need to let everyone know that we found their monies but we need more confirmations */
+                const waitingForConfirmations = {
+                  address: payload.wallet.address,
+                  amount: payload.totalAmount,
+                  confirmationsRemaining: confirmationsRemaining,
+                  status: 102,
+                  request: payload.request,
+                  privateKey: payload.privateKey
+                }
+
+                Helpers.log(util.format('[INFO] Worker #%s found %s for [%s] but is awaiting confirmations. %s blocks to go', cluster.worker.id, payload.totalAmount, payload.wallet.address, (confirmationsRequired - (payload.topBlock.height - payload.fundsFoundInBlock))))
+
+                /* Send the notice back to the requestor, then nack the message (so it is tried again later,
+                   and then finally resolve out */
+                publicMQ.sendToQueue(Config.queues.complete, waitingForConfirmations, { persistent: true })
+                  .then(() => { return privateMQ.nack(message) })
+                  .then(() => { return resolve() })
+              } else if (payload.topBlock.height > payload.maxHeight && (payload.topBlock.height - payload.fundsFoundInBlock) >= confirmationsRequired) {
+                /* We found funds but it's not at least the amount that we requested and unfortunately
+                   we've also ran out of time to look for more. Build a response that we can send back
+                   to the requestor to let them know that we've received something, but not what they
+                   requested, their request has timed out, and what we did receive will be on its way
+                   shortly */
+
+                const partialResponse = {
+                  address: payload.wallet.address,
+                  status: 206, // Partial Content (aka Partial Payment)
+                  request: payload.request,
+                  privateKey: payload.privateKey
+                }
+
+                /* Stick our funds in our payload */
+                payload.funds = payload.walletOutputs
+                const totalAmount = payload.totalAmount
+                delete payload.walletOutputs
+                delete payload.totalAmount
+                delete payload.fundsFoundInBlock
+
+                /* First we encrypt the object that we are going to send to our queues */
+                const encryptedPayload = { encrypted: crypto.encrypt(payload) }
+
+                Helpers.log(util.format('[INFO] Worker #%s found %s for [%s] and is forwarding request to send workers', cluster.worker.id, totalAmount, payload.wallet.address))
+
+                /* Send the notice back to the requestor, then act the messages as we're done here */
+                publicMQ.sendToQueue(Config.queues.complete, partialResponse, { persistent: true })
+                  .then(() => { return privateMQ.sendToQueue(Config.queues.send, encryptedPayload, { persistent: true }) })
+                  .then(() => { return privateMQ.ack(message) })
+                  .then(() => { return resolve() })
+              } else {
+                /* We found some fund but not the amount that we are looking for and we still have
+                   time to look for more before considering the request complete */
+
+                var blocksRemaining = (payload.maxHeight - payload.topBlock.height)
+                if (blocksRemaining < 0) {
+                  blocksRemaining = 0
+                }
+
+                /* We need to let everyone know that we found some monies but we need more */
+                const waitingForConfirmationsNotEnough = {
+                  address: payload.wallet.address,
+                  amount: payload.totalAmount,
+                  blocksRemaining: blocksRemaining,
+                  status: 102,
+                  request: payload.request,
+                  privateKey: payload.privateKey
+                }
+
+                Helpers.log(util.format('[INFO] Worker #%s found %s for [%s] but we need to look for more', cluster.worker.id, payload.totalAmount, payload.wallet.address))
+
+                /* Send the notice to the requestor that we found funds and that we're still looking */
+                publicMQ.sendToQueue(Config.queues.complete, waitingForConfirmationsNotEnough, { persistent: true })
+                  .then(() => { return privateMQ.nack(message) })
+                  .then(() => { return resolve() })
+              }
+            }
+          })
+          .then(() => {
+            /* If we made it this far, then that means that we probably didn't find any funds */
+
+            /* If we have not found any funds and our window for the request is closed, handle it */
+            if (payload.topBlock.height > payload.maxHeight && payload.walletOutputs.length === 0) {
+              const response = {
+                address: payload.wallet.address,
+                keys: {
+                  privateSpend: payload.wallet.spend.privateKey,
+                  privateView: payload.wallet.view.privateKey
+                },
+                status: 408, // Request Timed Out
+                request: payload.request,
+                privateKey: payload.privateKey
+              }
+
+              /* Send the 'cancelled' wallet back to the requestor letting them know that we're
+                 done processing this request and they can do with it what they will */
+
+              Helpers.log(util.format('[INFO] Worker #%s timed out wallet [%s]', cluster.worker.id, payload.wallet.address))
+
+              publicMQ.sendToQueue(Config.queues.complete, response, { persistent: true })
+                .then(() => { return privateMQ.ack(message) })
+                .then(() => { return resolve() })
+            }
+
+            /* Else, send the request back into the stack */
+            return privateMQ.nack(message)
+          })
+          .then(() => { return resolve() })
+          .catch(error => { return reject(error) })
       })
-    } catch (e) {
-      log(util.format('Error in worker #%s: %s', cluster.worker.id, e.toString()))
-      cluster.worker.kill()
     }
 
-    log(util.format('Worker #%s awaiting requests', cluster.worker.id))
-  }())
+    return run()
+      .catch(error => {
+        Helpers.log(util.format('[INFO] Error encountered in worker %s: %s', cluster.worker.id, error.toString()))
+        privateMQ.nack(message).catch((error) => Helpers.log(util.format('Worker #%s: Could not nack message [%s]', cluster.worker.id, error.toString())))
+      })
+  })
+
+  publicMQ.connect()
+    .then(() => { return publicMQ.createQueue(Config.queues.complete) })
+    .then(() => { return privateMQ.connect() })
+    .then(() => { return privateMQ.createQueue(Config.queues.send) })
+    .then(() => { return privateMQ.registerConsumer(Config.queues.scan, 1) })
+
+  Helpers.log(util.format('Worker #%s awaiting requests', cluster.worker.id))
 }
