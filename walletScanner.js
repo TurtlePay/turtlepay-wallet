@@ -10,6 +10,7 @@ const cluster = require('cluster')
 require('colors')
 const Config = require('./config.json')
 const Helpers = require('./lib/helpers')
+const packageInfo = require('../package.json')
 const Rabbit = require('./lib/rabbit')
 const request = require('request-promise-native')
 const TurtleCoinUtils = require('turtlecoin-utils').CryptoNote
@@ -17,6 +18,8 @@ const util = require('util')
 
 const cpuCount = require('os').cpus().length
 const cryptoUtils = new TurtleCoinUtils()
+
+const userAgent = util.format('%s/%s', packageInfo.name, packageInfo.version)
 
 function spawnNewWorker () {
   cluster.fork()
@@ -102,7 +105,10 @@ if (cluster.isMaster) {
         /* Let's get some basic block inofmration regarding our wallet */
         request({
           url: Config.blockHeaderUrl + 'top',
-          json: true
+          json: true,
+          headers: {
+            'User-Agent': userAgent
+          }
         })
           .then(topBlock => {
             payload.topBlock = topBlock
@@ -123,6 +129,9 @@ if (cluster.isMaster) {
               body: {
                 scanHeight: payload.scanHeight,
                 blockCount: (Config.maximumScanBlocks + 1)
+              },
+              headers: {
+                'User-Agent': userAgent
               }
             })
           })
