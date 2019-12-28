@@ -205,7 +205,7 @@ if (cluster.isMaster) {
                 Helpers.log(util.format('[INFO] Worker #%s found %s for [%s] and is forwarding request to send workers', cluster.worker.id, totalAmount, payload.wallet.address))
 
                 /* Signal to the workers who send the funds to their real destination that things are ready */
-                privateMQ.sendToQueue(Config.queues.send, encryptedPayload, { persistent: true })
+                return privateMQ.sendToQueue(Config.queues.send, encryptedPayload, { persistent: true })
                   .then(() => { return publicMQ.sendToQueue(Config.queues.complete, goodResponse, { persistent: true }) })
                   .then(() => { return privateMQ.ack(message) })
                   .then(() => { return resolve() })
@@ -235,7 +235,7 @@ if (cluster.isMaster) {
 
                 /* Send the notice back to the requestor, then nack the message (so it is tried again later,
                    and then finally resolve out */
-                publicMQ.sendToQueue(Config.queues.complete, waitingForConfirmations, { persistent: true })
+                return publicMQ.sendToQueue(Config.queues.complete, waitingForConfirmations, { persistent: true })
                   .then(() => { return privateMQ.nack(message) })
                   .then(() => { return resolve() })
               } else if (payload.topBlock.height > payload.maxHeight && (payload.topBlock.height - payload.fundsFoundInBlock) >= confirmationsRequired) {
@@ -299,7 +299,7 @@ if (cluster.isMaster) {
                 Helpers.log(util.format('[INFO] Worker #%s found %s for [%s] but we need to look for more', cluster.worker.id, payload.totalAmount, payload.wallet.address))
 
                 /* Send the notice to the requestor that we found funds and that we're still looking */
-                publicMQ.sendToQueue(Config.queues.complete, waitingForConfirmationsNotEnough, { persistent: true })
+                return publicMQ.sendToQueue(Config.queues.complete, waitingForConfirmationsNotEnough, { persistent: true })
                   .then(() => { return privateMQ.nack(message) })
                   .then(() => { return resolve() })
               }
@@ -330,7 +330,7 @@ if (cluster.isMaster) {
 
               Helpers.log(util.format('[INFO] Worker #%s timed out wallet [%s]', cluster.worker.id, payload.wallet.address))
 
-              publicMQ.sendToQueue(Config.queues.complete, response, { persistent: true })
+              return publicMQ.sendToQueue(Config.queues.complete, response, { persistent: true })
                 .then(() => { return privateMQ.ack(message) })
                 .then(() => { return resolve() })
             }
@@ -346,7 +346,8 @@ if (cluster.isMaster) {
     return run()
       .catch(error => {
         Helpers.log(util.format('[INFO] Error encountered in worker %s: %s', cluster.worker.id, error.toString()))
-        privateMQ.nack(message).catch((error) => Helpers.log(util.format('Worker #%s: Could not nack message [%s]', cluster.worker.id, error.toString())))
+        return privateMQ.nack(message)
+          .catch(error => Helpers.log(util.format('Worker #%s: Could not nack message [%s]', cluster.worker.id, error.toString())))
       })
   })
 
