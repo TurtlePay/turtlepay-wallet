@@ -130,7 +130,7 @@ if (cluster.isMaster) {
             request: payload,
             privateKey: tmp.keys.privateKey,
             txs: [],
-            viewOnly: (newAddress.paymentId)
+            viewOnly: !!(newAddress.paymentId)
           }
 
           /* First, we encrypt the object that we are going to send to our queues */
