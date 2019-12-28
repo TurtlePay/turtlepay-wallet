@@ -117,7 +117,7 @@ if (cluster.isMaster) {
 
         return publicMQ.sendToQueue(Config.queues.complete, response, { persistent: true })
           .then(() => {
-            payload.tx.hash = payload.txs.join(',')
+            payload.tx = { hash: payload.txs.join(',') }
             Helpers.log(util.format('[INFO] Worker #%s skipping delivery of [%s] from [%s] in transaction(s) [%s] as it is view only', cluster.worker.id, payload.amountReceived, payload.wallet.address, payload.tx.hash))
           })
       }
