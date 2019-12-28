@@ -91,7 +91,7 @@ if (cluster.isMaster) {
           payload = crypto.decrypt(payload.encrypted)
         }
 
-        Helpers.log(util.format('Scanning for transactions to [%s]', payload.wallet.address))
+        Helpers.log(util.format('Scanning for transactions to [%s] (viewOnly: %s)', payload.wallet.address, payload.viewOnly))
 
         var confirmationsRequired = (typeof payload.request.confirmations !== 'undefined') ? payload.request.confirmations : Config.defaultConfirmations
 
