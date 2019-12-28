@@ -149,6 +149,11 @@ if (cluster.isMaster) {
               for (var j = 0; j < block.transactions.length; j++) {
                 var transaction = block.transactions[j]
 
+                /* If we are using a "view only" wallet, via the v2 mechanism, check to
+                   to make sure that the payment ID included matches ours that we are
+                   looking for, as we don't want to trigger on the wrong transactions */
+                if (payload.viewOnly && payload.wallet.paymentId.toLowerCase() !== transaction.paymentId.toLowerCase()) continue
+
                 /* Check to see if any of the outputs in the transaction belong to us */
                 var outputs = cryptoUtils.scanTransactionOutputs(transaction.publicKey, transaction.outputs, payload.wallet.view.privateKey, payload.wallet.spend.publicKey, payload.wallet.spend.privateKey)
 
@@ -160,6 +165,7 @@ if (cluster.isMaster) {
 
                 /* Loop through any found outputs and start tallying them up */
                 for (var l = 0; l < outputs.length; l++) {
+                  if (payload.txs.indexOf(transaction.hash) === -1) payload.tx.push(transaction.hash)
                   payload.totalAmount += outputs[l].amount
                   payload.walletOutputs.push(outputs[l])
                 }
@@ -180,6 +186,10 @@ if (cluster.isMaster) {
                   status: 100, // Continue
                   request: payload.request,
                   privateKey: payload.privateKey
+                }
+
+                if (payload.viewOnly) {
+                  goodResponse.paymentId = payload.wallet.paymentId
                 }
 
                 /* Stick our funds in our payload and clean up our stack */
@@ -217,6 +227,10 @@ if (cluster.isMaster) {
                   privateKey: payload.privateKey
                 }
 
+                if (payload.viewOnly) {
+                  waitingForConfirmations.paymentId = payload.wallet.paymentId
+                }
+
                 Helpers.log(util.format('[INFO] Worker #%s found %s for [%s] but is awaiting confirmations. %s blocks to go', cluster.worker.id, payload.totalAmount, payload.wallet.address, (confirmationsRequired - (payload.topBlock.height - payload.fundsFoundInBlock))))
 
                 /* Send the notice back to the requestor, then nack the message (so it is tried again later,
@@ -236,6 +250,10 @@ if (cluster.isMaster) {
                   status: 206, // Partial Content (aka Partial Payment)
                   request: payload.request,
                   privateKey: payload.privateKey
+                }
+
+                if (payload.viewOnly) {
+                  partialResponse.paymentId = payload.wallet.paymentId
                 }
 
                 /* Stick our funds in our payload */
@@ -274,6 +292,10 @@ if (cluster.isMaster) {
                   privateKey: payload.privateKey
                 }
 
+                if (payload.viewOnly) {
+                  waitingForConfirmationsNotEnough.paymentId = payload.wallet.paymentId
+                }
+
                 Helpers.log(util.format('[INFO] Worker #%s found %s for [%s] but we need to look for more', cluster.worker.id, payload.totalAmount, payload.wallet.address))
 
                 /* Send the notice to the requestor that we found funds and that we're still looking */
@@ -297,6 +319,10 @@ if (cluster.isMaster) {
                 status: 408, // Request Timed Out
                 request: payload.request,
                 privateKey: payload.privateKey
+              }
+
+              if (payload.viewOnly) {
+                response.paymentId = payload.wallet.paymentId
               }
 
               /* Send the 'cancelled' wallet back to the requestor letting them know that we're

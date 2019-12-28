@@ -82,26 +82,48 @@ if (cluster.isMaster) {
 
   privateMQ.on('message', (queue, message, payload) => {
     function run () {
+      /* If the payload is encrypted, we need to decrypt it */
+      if (payload.encrypted) {
+        payload = crypto.decrypt(payload.encrypted)
+      }
+
+      /* Sort our outputs from smallest to largest */
+      payload.funds.sort((a, b) => (a.amount > b.amount) ? 1 : ((b.amount > a.amount) ? -1 : 0))
+
+      /* Pull some of the information we need for further processing
+           out of the outputs we received */
+      payload.totalToSend = 0
+      const amounts = []
+      for (var i = 0; i < payload.funds.length; i++) {
+        payload.totalToSend += payload.funds[i].amount
+        amounts.push(payload.funds[i].amount)
+      }
+
+      /* Save off the amount that we actually received */
+      payload.amountReceived = payload.totalToSend
+
+      /* If this is a view only wallet, we aren't actually going to
+         send anything on, because we don't have access to the wallet
+         private spend key to do so */
+      if (payload.viewOnly) {
+        const response = {
+          address: payload.wallet.address,
+          amountReceived: payload.amountReceived,
+          transactions: payload.tx,
+          status: 200, // OK
+          request: payload.request,
+          privateKey: payload.privateKey
+        }
+
+        return publicMQ.sendToQueue(Config.queues.complete, response, { persistent: true })
+          .then(() => {
+            payload.tx.hash = payload.txs.join(',')
+            Helpers.log(util.format('[INFO] Worker #%s skipping delivery of [%s] from [%s] in transaction(s) [%s] as it is view only', cluster.worker.id, payload.amountReceived, payload.wallet.address, payload.tx.hash))
+          })
+      }
+
       return new Promise((resolve, reject) => {
         const transactionFee = payload.fee || Config.defaultNetworkFee
-
-        /* If the payload is encrypted, we need to decrypt it */
-        if (payload.encrypted) {
-          payload = crypto.decrypt(payload.encrypted)
-        }
-
-        /* Sort our outputs from smallest to largest */
-        payload.funds.sort((a, b) => (a.amount > b.amount) ? 1 : ((b.amount > a.amount) ? -1 : 0))
-
-        /* Pull some of the information we need for further processing
-           out of the outputs we received */
-        payload.totalToSend = 0
-        const amounts = []
-        for (var i = 0; i < payload.funds.length; i++) {
-          payload.totalToSend += payload.funds[i].amount
-          amounts.push(payload.funds[i].amount)
-        }
-
         /* If there is less funds available than the network fee
            we can't really do anything. We're not going to pay to
            to send on funds we didn't receive enough for to at least
@@ -123,9 +145,6 @@ if (cluster.isMaster) {
           Helpers.log(util.format('[INFO] Worker #%s encountered wallet with insufficient funds [%s]', cluster.worker.id, payload.wallet.address))
           return resolve()
         }
-
-        /* Save off the amount that we actually received */
-        payload.amountReceived = payload.totalToSend
 
         /* Deduct the network transaction fee */
         payload.totalToSend -= transactionFee
@@ -149,20 +168,20 @@ if (cluster.isMaster) {
           }
         })
           .then(randomOutputs => {
-          /* Validate that we received enough randomOutputs to complete the request */
+            /* Validate that we received enough randomOutputs to complete the request */
             if (randomOutputs.length !== payload.funds.length) {
-            /* Something didn't work right, let's leave this for someone else to handle */
+              /* Something didn't work right, let's leave this for someone else to handle */
               return reject(new Error(util.format('[INFO] Worker #%s encountered a request with an invalid number of random outputs [%s]', cluster.worker.id, payload.wallet.address)))
             }
 
             /* Although the block API returns the random outputs sorted by amount,
-             we're going to sort it ourselves quick just to make sure */
+               we're going to sort it ourselves quick just to make sure */
             randomOutputs.sort((a, b) => (a.amount > b.amount) ? 1 : ((b.amount > a.amount) ? -1 : 0))
 
             /* We received more random outputs than we actually need for each of the amounts
-             just in case one of the outputs we received matches one we're trying
-             to mix with. We need to make some sense of this before trying
-             to build our transaction otherwise things are going to get very ugly. */
+               just in case one of the outputs we received matches one we're trying
+               to mix with. We need to make some sense of this before trying
+               to build our transaction otherwise things are going to get very ugly. */
 
             /* We'll start looping through our outputs to run sanity checks */
             for (var j = 0; j < payload.funds.length; j++) {
@@ -170,18 +189,18 @@ if (cluster.isMaster) {
               var randoms = randomOutputs[j]
 
               /* If, for some reason the amounts of the random outputs
-               aren't for this set of funds, something went wrong...
-               very very wrong */
+                 aren't for this set of funds, something went wrong...
+                 very very wrong */
               if (randoms.amount !== payload.funds[j].amount) {
                 return reject(new Error('Error handling random outputs'))
               }
 
               /* Loop through the fake inputs to do some basic checking including
-               that we actually need additional fake inputs */
+                 that we actually need additional fake inputs */
               randoms.outs.forEach((elem) => {
                 if (elem.out_key !== payload.funds[j].keyImage && saneRandoms.length < Config.defaultMixinCount) {
-                /* Toss them in the stack in a way that the library we use
-                   requires them */
+                  /* Toss them in the stack in a way that the library we use
+                     requires them */
                   saneRandoms.push({
                     globalIndex: elem.global_amount_index,
                     key: elem.out_key
@@ -195,8 +214,8 @@ if (cluster.isMaster) {
             return new Promise(resolve => { return resolve(randomOutputs) })
           })
           .then(randomOutputs => {
-          /* Decode the payload address so that we can figure out if we need to send
-             the funds with a payment ID */
+            /* Decode the payload address so that we can figure out if we need to send
+               the funds with a payment ID */
             const decodedAddress = cryptoUtils.decodeAddress(payload.request.address)
             var paymentId = null
             if (decodedAddress.paymentId.length !== 0) {
@@ -228,12 +247,12 @@ if (cluster.isMaster) {
               }
 
               /* Send the 'completed' request information back
-               to the public processors so we can let the requestor
-               know that the process is complete */
+                 to the public processors so we can let the requestor
+                 know that the process is complete */
               return publicMQ.sendToQueue(Config.queues.complete, response, { persistent: true })
             } else {
-            /* For some reason, the relay failed, we'll send it back
-               to the queue to retry later */
+              /* For some reason, the relay failed, we'll send it back
+                 to the queue to retry later */
               return reject(new Error(util.format('[INFO] Worker #%s failed to relay [%s] from [%s] to [%s]', cluster.worker.id, payload.totalToSend, payload.wallet.address, payload.request.address)))
             }
           })

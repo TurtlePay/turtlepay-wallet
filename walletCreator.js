@@ -80,8 +80,30 @@ if (cluster.isMaster) {
   publicMQ.on('message', (queue, message, payload) => {
     function run () {
       /* Generate a new address, nothing fancy going on here, just a brand new address */
-      const newAddress = cryptoUtils.createNewAddress()
+      var newAddress = cryptoUtils.createNewAddress()
       const tmp = {}
+
+      if (payload.privateViewKey) {
+        const decodedAddress = cryptoUtils.decodeAddress(payload.address)
+        const publicViewKey = cryptoUtils.privateKeyToPublicKey(payload.privateViewKey)
+
+        if (publicViewKey !== decodedAddress.publicViewKey) throw new Error('derived public view key does not match address supplied')
+
+        newAddress = {
+          keys: {
+            spend: {
+              privateKey: false,
+              publicKey: decodedAddress.publicSpendKey
+            },
+            view: {
+              privateKey: payload.privateViewKey,
+              publicKey: decodedAddress.publicViewKey
+            }
+          },
+          address: payload.address,
+          paymentId: newAddress.keys.spend.publicKey
+        }
+      }
 
       /* We need to go get some information about the current top block */
       return request({
@@ -108,7 +130,9 @@ if (cluster.isMaster) {
             scanHeight: tmp.topBlock.height,
             maxHeight: (tmp.topBlock.height + Config.maximumScanBlocks),
             request: payload,
-            privateKey: tmp.keys.privateKey
+            privateKey: tmp.keys.privateKey,
+            txs: [],
+            viewOnly: (newAddress.paymentId)
           }
 
           /* First, we encrypt the object that we are going to send to our queues */
@@ -124,6 +148,11 @@ if (cluster.isMaster) {
             scanHeight: tmp.topBlock.height,
             maxHeight: (tmp.topBlock.height + Config.maximumScanBlocks),
             publicKey: tmp.keys.publicKey
+          }
+
+          if (newAddress.paymentId) {
+            response.address = cryptoUtils.createIntegratedAddress(newAddress.address, newAddress.paymentId)
+            response.paymentId = newAddress.paymentId
           }
 
           /* Go ahead and fire that information back to the public API for the related request */
