@@ -130,8 +130,10 @@ if (cluster.isMaster) {
             request: payload,
             privateKey: tmp.keys.privateKey,
             txs: [],
-            viewOnly: !!(newAddress.paymentId)
+            viewOnly: false
           }
+
+          if (newAddress.paymentId) scanPayload.viewOnly = true
 
           /* First, we encrypt the object that we are going to send to our queues */
           const encryptedPayload = { encrypted: crypto.encrypt(scanPayload) }
