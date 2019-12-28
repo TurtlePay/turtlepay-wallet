@@ -90,18 +90,16 @@ if (cluster.isMaster) {
         if (publicViewKey !== decodedAddress.publicViewKey) throw new Error('derived public view key does not match address supplied')
 
         newAddress = {
-          keys: {
-            spend: {
-              privateKey: false,
-              publicKey: decodedAddress.publicSpendKey
-            },
-            view: {
-              privateKey: payload.privateViewKey,
-              publicKey: decodedAddress.publicViewKey
-            }
+          spend: {
+            privateKey: false,
+            publicKey: decodedAddress.publicSpendKey
+          },
+          view: {
+            privateKey: payload.privateViewKey,
+            publicKey: decodedAddress.publicViewKey
           },
           address: payload.address,
-          paymentId: newAddress.keys.spend.publicKey
+          paymentId: newAddress.spend.publicKey
         }
       }
 
