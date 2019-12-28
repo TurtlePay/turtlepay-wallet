@@ -10,7 +10,7 @@ const cluster = require('cluster')
 require('colors')
 const Config = require('./config.json')
 const Helpers = require('./lib/helpers')
-const packageInfo = require('../package.json')
+const packageInfo = require('./package.json')
 const Rabbit = require('./lib/rabbit')
 const request = require('request-promise-native')
 const TurtleCoinUtils = require('turtlecoin-utils').CryptoNote
