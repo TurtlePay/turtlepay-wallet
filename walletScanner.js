@@ -269,7 +269,7 @@ if (cluster.isMaster) {
                 Helpers.log(util.format('[INFO] Worker #%s found %s for [%s] and is forwarding request to send workers', cluster.worker.id, totalAmount, payload.wallet.address))
 
                 /* Send the notice back to the requestor, then act the messages as we're done here */
-                publicMQ.sendToQueue(Config.queues.complete, partialResponse, { persistent: true })
+                return publicMQ.sendToQueue(Config.queues.complete, partialResponse, { persistent: true })
                   .then(() => { return privateMQ.sendToQueue(Config.queues.send, encryptedPayload, { persistent: true }) })
                   .then(() => { return privateMQ.ack(message) })
                   .then(() => { return resolve() })
