@@ -165,7 +165,7 @@ if (cluster.isMaster) {
 
                 /* Loop through any found outputs and start tallying them up */
                 for (var l = 0; l < outputs.length; l++) {
-                  if (payload.txs.indexOf(transaction.hash) === -1) payload.tx.push(transaction.hash)
+                  if (payload.txs.indexOf(transaction.hash) === -1) payload.txs.push(transaction.hash)
                   payload.totalAmount += outputs[l].amount
                   payload.walletOutputs.push(outputs[l])
                 }
