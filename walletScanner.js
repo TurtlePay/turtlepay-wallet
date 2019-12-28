@@ -209,6 +209,7 @@ if (cluster.isMaster) {
                   .then(() => { return publicMQ.sendToQueue(Config.queues.complete, goodResponse, { persistent: true }) })
                   .then(() => { return privateMQ.ack(message) })
                   .then(() => { return resolve() })
+                  .then(() => { return true })
               } else if (payload.totalAmount >= payload.request.amount) {
                 /* We found all the funds we need, but we don't have enough confirmations yet */
 
@@ -238,6 +239,7 @@ if (cluster.isMaster) {
                 return publicMQ.sendToQueue(Config.queues.complete, waitingForConfirmations, { persistent: true })
                   .then(() => { return privateMQ.nack(message) })
                   .then(() => { return resolve() })
+                  .then(() => { return true })
               } else if (payload.topBlock.height > payload.maxHeight && (payload.topBlock.height - payload.fundsFoundInBlock) >= confirmationsRequired) {
                 /* We found funds but it's not at least the amount that we requested and unfortunately
                    we've also ran out of time to look for more. Build a response that we can send back
@@ -273,6 +275,7 @@ if (cluster.isMaster) {
                   .then(() => { return privateMQ.sendToQueue(Config.queues.send, encryptedPayload, { persistent: true }) })
                   .then(() => { return privateMQ.ack(message) })
                   .then(() => { return resolve() })
+                  .then(() => { return true })
               } else {
                 /* We found some fund but not the amount that we are looking for and we still have
                    time to look for more before considering the request complete */
@@ -302,10 +305,13 @@ if (cluster.isMaster) {
                 return publicMQ.sendToQueue(Config.queues.complete, waitingForConfirmationsNotEnough, { persistent: true })
                   .then(() => { return privateMQ.nack(message) })
                   .then(() => { return resolve() })
+                  .then(() => { return true })
               }
             }
+
+            return false
           })
-          .then(() => {
+          .then(handled => {
             /* If we made it this far, then that means that we probably didn't find any funds */
 
             /* If we have not found any funds and our window for the request is closed, handle it */
@@ -333,10 +339,10 @@ if (cluster.isMaster) {
               return publicMQ.sendToQueue(Config.queues.complete, response, { persistent: true })
                 .then(() => { return privateMQ.ack(message) })
                 .then(() => { return resolve() })
+            } else if (!handled) {
+              /* Else, send the request back into the stack */
+              return privateMQ.nack(message)
             }
-
-            /* Else, send the request back into the stack */
-            return privateMQ.nack(message)
           })
           .then(() => { return resolve() })
           .catch(error => { return reject(error) })
