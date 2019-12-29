@@ -329,6 +329,7 @@ if (cluster.isMaster) {
 
               if (payload.viewOnly) {
                 response.paymentId = payload.wallet.paymentId
+                delete response.keys
               }
 
               /* Send the 'cancelled' wallet back to the requestor letting them know that we're
