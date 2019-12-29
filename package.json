@@ -1,6 +1,6 @@
 {
   "name": "turtlepay-wallet",
-  "version": "0.0.5",
+  "version": "0.1.0",
   "description": "TurtlePay: TurtleCoin Wallet Service (TWS)",
   "main": "index.js",
   "scripts": {
@@ -30,11 +30,11 @@
     "aes-js": "^3.1.2",
     "amqplib": "^0.5.5",
     "colors": "^1.4.0",
-    "dotenv": "^8.1.0",
-    "pem": "^1.14.2",
+    "dotenv": "^8.2.0",
+    "pem": "^1.14.3",
     "request": "^2.88.0",
-    "request-promise-native": "^1.0.7",
-    "turtlecoin-utils": "^1.0.5",
+    "request-promise-native": "^1.0.8",
+    "turtlecoin-utils": "^1.0.15",
     "uuid": "^3.3.3"
   }
 }
