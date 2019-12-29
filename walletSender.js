@@ -108,8 +108,9 @@ if (cluster.isMaster) {
       if (payload.viewOnly) {
         const response = {
           address: payload.wallet.address,
+          paymentId: payload.wallet.paymentId,
           amountReceived: payload.amountReceived,
-          transactions: payload.tx,
+          transactions: payload.txs,
           status: 200, // OK
           request: payload.request,
           privateKey: payload.privateKey
