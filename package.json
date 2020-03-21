@@ -31,10 +31,10 @@
     "amqplib": "^0.5.5",
     "colors": "^1.4.0",
     "dotenv": "^8.2.0",
-    "pem": "^1.14.3",
-    "request": "^2.88.0",
+    "pem": "^1.14.4",
+    "request": "^2.88.2",
     "request-promise-native": "^1.0.8",
-    "turtlecoin-utils": "^1.0.15",
-    "uuid": "^3.3.3"
+    "turtlecoin-utils": "^1.0.20",
+    "uuid": "^3.4.0"
   }
 }
